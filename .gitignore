@@ -1,0 +1,6 @@
+clinvar*
+gatk*
+Homo_sapiens*
+*.pyc
+__pycache__
+run.sh
