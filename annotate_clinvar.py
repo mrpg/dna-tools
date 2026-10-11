@@ -3,7 +3,7 @@
 Annotate personal gVCF variants against ClinVar to find clinically relevant variants.
 
 Usage:
-    python annotate_clinvar.py <sample.g.vcf.gz> <clinvar.vcf.gz> [output.tsv] > report.md
+    python annotate_clinvar.py <sample.g.vcf.gz> <clinvar.vcf.gz> [output.tsv] [reference.fa] > report.md
 
 The sample file must be a gVCF (genomic VCF) containing multi-allelic ALT
 records — standard single-ALT VCFs are not supported because this script
@@ -17,8 +17,14 @@ The clinvar.vcf.gz file must be accompanied by a clinvar.vcf.gz.tbi file.
     tabix -p vcf clinvar.vcf.gz
 
 Matching is by exact (chrom, pos, ref, alt), and the sample's genotype is
-checked to confirm the matched ALT allele is actually carried. For reliable
-indel matching, normalize both files first:
+checked to confirm the matched ALT allele is actually carried. Each sample
+allele is normalized before lookup: multi-allelic gVCF records pad every
+allele to the longest REF (e.g. TAAA>TAA for a 1-bp deletion), so the shared
+suffix/prefix is trimmed and, if reference.fa is given, indels are
+left-aligned. Output pos/ref/alt use the normalized allele; decoded_genotype
+keeps the record's original allele spelling. Always pass reference.fa (the
+same FASTA used for ClinVar) for complete indel matching. ClinVar must be
+normalized beforehand:
     bcftools norm \
             -r 1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,X,Y,MT \
             -f Homo_sapiens.GRCh38.dna.primary_assembly.fa \
@@ -73,12 +79,40 @@ def parse_clinvar(clinvar_path):
     return clinvar
 
 
-def annotate_sample(sample_path, clinvar):
+def normalize_allele(chrom, pos, ref, alt, fasta=None):
+    """Trim shared bases and left-align (vt-style) one REF/ALT pair.
+
+    Without a FASTA, or on a contig the FASTA lacks, indels are only trimmed.
+    """
+    orig = (pos, ref, alt)
+    ref, alt = ref.upper(), alt.upper()
+    changed = True
+    while changed:
+        changed = False
+        if ref and alt and ref[-1] == alt[-1] and (len(ref) > 1 or len(alt) > 1):
+            if fasta is None and (len(ref) == 1 or len(alt) == 1):
+                break
+            ref, alt = ref[:-1], alt[:-1]
+            changed = True
+        if (not ref or not alt) and pos > 1:
+            try:
+                base = fasta.fetch(chrom, pos - 2, pos - 1).upper()
+            except KeyError:
+                return normalize_allele(chrom, *orig)
+            ref, alt, pos = base + ref, base + alt, pos - 1
+            changed = True
+    while len(ref) > 1 and len(alt) > 1 and ref[0] == alt[0]:
+        ref, alt, pos = ref[1:], alt[1:], pos + 1
+    return pos, ref, alt
+
+
+def annotate_sample(sample_path, clinvar, fasta=None):
     """Scan sample VCF and match against ClinVar."""
     total = count_vcf_records(sample_path)
     vcf = pysam.VariantFile(sample_path)
     results = []
     matched = 0
+    renormalized = 0
 
     for rec in tqdm(vcf, total=total, desc="Scanning sample", unit=" variants"):
         if rec.alts is None or rec.alts[0] == ".":
@@ -92,14 +126,19 @@ def annotate_sample(sample_path, clinvar):
         gq = sample.get("GQ", None)
 
         for alt_idx, alt in enumerate(rec.alts, start=1):
-            if alt == "." or alt == "<NON_REF>" or alt == "<*>":
+            if alt in (".", "*", "<NON_REF>", "<*>"):
                 continue
-            key = (rec.chrom, rec.pos, rec.ref, alt)
+            # Only carried alleles can match; skip the normalization cost otherwise
+            if gt and alt_idx not in gt:
+                continue
+            pos, ref, norm_alt = normalize_allele(
+                rec.chrom, rec.pos, rec.ref, alt, fasta
+            )
+            key = (rec.chrom, pos, ref, norm_alt)
             if key in clinvar:
-                # Verify the sample's genotype actually references this ALT allele
-                if gt and alt_idx not in gt:
-                    continue
                 matched += 1
+                if (pos, ref, norm_alt) != (rec.pos, rec.ref, alt):
+                    renormalized += 1
                 cv = clinvar[key]
                 gt_str = (
                     "/".join(str(a) if a is not None else "." for a in gt)
@@ -140,12 +179,12 @@ def annotate_sample(sample_path, clinvar):
                 results.append(
                     {
                         "chrom": rec.chrom,
-                        "pos": rec.pos,
+                        "pos": pos,
                         "rsid": (
                             rec.id if rec.id else (f"rs{cv['rs']}" if cv["rs"] else "")
                         ),
-                        "ref": rec.ref,
-                        "alt": alt,
+                        "ref": ref,
+                        "alt": norm_alt,
                         "genotype": gt_str,
                         "decoded_genotype": decoded_gt,
                         "depth": dp,
@@ -160,7 +199,11 @@ def annotate_sample(sample_path, clinvar):
                     }
                 )
 
-    print(f"Done: {matched:,} ClinVar matches.", file=sys.stderr)
+    print(
+        f"Done: {matched:,} ClinVar matches "
+        f"({renormalized:,} only after allele normalization).",
+        file=sys.stderr,
+    )
     return results
 
 
@@ -266,9 +309,22 @@ def main():
     sample_path = sys.argv[1]
     clinvar_path = sys.argv[2]
     output_path = sys.argv[3] if len(sys.argv) > 3 else "clinvar_annotated_variants.tsv"
+    fasta = pysam.FastaFile(sys.argv[4]) if len(sys.argv) > 4 else None
+    if fasta is not None:
+        with pysam.VariantFile(sample_path) as vcf:
+            if not set(fasta.references) & set(vcf.header.contigs):
+                sys.exit(
+                    "Error: reference.fa shares no contig names with the sample VCF "
+                    "(e.g. 'chr1' vs '1')."
+                )
+    else:
+        print(
+            "Warning: no reference.fa given; indels are trimmed but not left-aligned.",
+            file=sys.stderr,
+        )
 
     clinvar = parse_clinvar(clinvar_path)
-    results = annotate_sample(sample_path, clinvar)
+    results = annotate_sample(sample_path, clinvar, fasta)
 
     df = pd.DataFrame(results)
     if df.empty:
